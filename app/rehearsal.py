@@ -20,12 +20,27 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import List, Optional, Sequence, Tuple
 
 
 def _eps(magnitude: float) -> float:
-    """随数量级缩放的浮点容差，抹平前缀和累加与 JSON 浮点解析误差。"""
+    """随数量级缩放的浮点容差，抹平前缀和累加与 JSON 浮点解析误差。
+
+    仅用于由拍数/速度换算得到的时间轴计算量（其本身不是十进制精确值）；
+    用户直接输入的静默秒数与最低翻页时间比较走 :func:`_silence_sufficient`
+    的十进制精确口径，与规划核心一致。
+    """
     return 1e-9 * max(1.0, abs(magnitude))
+
+
+def _silence_sufficient(silence: float, min_turn_time: float) -> bool:
+    """静默是否达标：按十进制字面量精确比较，恰好等于视为充足。
+
+    与 planner 的翻页点合法性同口径——略低于最低翻页时间（如
+    0.9999999999 对 1）不得视为充足，不使用任何浮点容差。
+    """
+    return Decimal(str(silence)) >= Decimal(str(min_turn_time))
 
 
 class RehearsalError(ValueError):
@@ -433,7 +448,7 @@ class Rehearsal:
                     to_playthrough=nxt.playthrough,
                     direction="forward" if to_page > from_page else "backward",
                     silence_seconds=silence,
-                    sufficient=silence + _eps(min_turn_time) >= min_turn_time,
+                    sufficient=_silence_sufficient(silence, min_turn_time),
                 )
             )
         return cues
