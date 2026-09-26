@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from decimal import Decimal
 from itertools import product
 
 import pytest
@@ -122,6 +123,66 @@ def test_measure_too_tall():
         )
 
 
+def test_decimal_boundary_measure_slightly_over_page_height():
+    # 1.0000000005 > 1：略超页高即判定超高，浮点容差不得放行
+    with pytest.raises(PlanningError, match="超过页面可用高度"):
+        plan_pages([1.0000000005], [0.0], 1, 0)
+
+
+def test_decimal_boundary_page_slightly_over_capacity():
+    # 0.6 + 0.4 = 1.0 > 0.9999999999：整页略超容量不得排入一页
+    plan = plan_pages([0.6, 0.4], [5, 0], 0.9999999999, 1)
+    assert plan.page_count == 2
+    assert plan.breaks == [1]
+
+
+def test_decimal_boundary_slightly_short_silence_not_qualified():
+    # 0.9999999999 < 1：略短静默不得视作达标，唯一可断页位置被排除后无解
+    with pytest.raises(PlanningError, match="无合法翻页方案"):
+        plan_pages([5, 5], [0.9999999999, 0], 6, 1)
+
+
+def test_decimal_boundary_required_break_slightly_short_silence():
+    # 必翻位置静默略短（0.9999999999 < 1）：必翻点静默不足
+    with pytest.raises(PlanningError, match="必翻点静默不足"):
+        plan_pages([1] * 3, [1, 0.9999999999, 0], 3, 1, required_breaks=[2])
+
+
+def test_decimal_boundary_maximin_distinguishes_tiny_silence_gap():
+    # 静默 1 与 1.0000000005 是不同值：最短静默最大化应选后者（断页 2），
+    # 浮点容差会把二者视为相等而错选字典序更小的断页 1
+    plan = plan_pages([1, 1, 1], [1, 1.0000000005, 0], 2, 1)
+    assert plan.page_count == 2
+    assert plan.breaks == [2]
+    assert plan.shortest_turn_silence == 1.0000000005
+
+
+def test_decimal_boundary_exact_decimal_sum_fits_page():
+    # 0.1 + 0.2 在十进制下恰为 0.3：恰好装满允许同页，used_height 恰为 0.3
+    plan = plan_pages([0.1, 0.2], [5, 0], 0.3, 1)
+    assert plan.page_count == 1
+    assert plan.pages[0].used_height == 0.3
+
+
+def test_decimal_boundary_exact_threshold_still_allowed():
+    # 静默恰好等于最低翻页时间（>= 判定）仍允许翻页；页恰好装满同样允许
+    plan = plan_pages([3, 3, 3], [2, 2, 0], 6, 2)
+    assert plan.page_count == 2
+    assert plan.breaks == [1]
+
+
+def test_non_finite_values_rejected():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(PlanningError, match="不是有限数值"):
+            plan_pages([bad, 1], [0.0, 0.0], 2, 0)
+        with pytest.raises(PlanningError, match="不是有限数值"):
+            plan_pages([1], [bad], 2, 0)
+        with pytest.raises(PlanningError, match="不是有限数值"):
+            plan_pages([1], [0.0], bad, 0)
+        with pytest.raises(PlanningError, match="不是有限数值"):
+            plan_pages([1], [0.0], 2, bad)
+
+
 def test_no_valid_plan():
     # 两小节各高 5、容量 6 -> 必须分开，但小节后静默 0 不达标。
     with pytest.raises(PlanningError, match="无合法翻页方案"):
@@ -203,3 +264,80 @@ def test_matches_bruteforce(seed):
         # 断页静默均达标
         for b in plan.breaks:
             assert silences[b - 1] + 1e-9 >= min_turn_time
+
+
+def brute_force_best_decimal(heights, silences, page_height, min_turn_time):
+    """十进制精确比较的暴力参考：枚举所有断页组合取最优；无方案返回 None。"""
+    n = len(heights)
+    cap = Decimal(str(page_height))
+    turn = Decimal(str(min_turn_time))
+    dec_h = [Decimal(str(h)) for h in heights]
+    dec_s = [Decimal(str(s)) for s in silences]
+    best = None
+
+    for mask in product([0, 1], repeat=n - 1):
+        breaks = [b + 1 for b, bit in enumerate(mask) if bit]
+        bounds = [0] + breaks + [n]
+        ok = True
+        turn_values = []
+        for idx in range(len(bounds) - 1):
+            a, e = bounds[idx], bounds[idx + 1]
+            if sum(dec_h[a:e]) > cap:
+                ok = False
+                break
+            if e < n and dec_s[e - 1] < turn:
+                ok = False
+                break
+            if e < n:
+                turn_values.append(dec_s[e - 1])
+        if not ok:
+            continue
+        key = (
+            len(bounds) - 1,
+            -min(turn_values) if turn_values else Decimal("-Infinity"),
+            breaks,
+        )
+        if best is None or key < best[0]:
+            best = (key, breaks)
+    return None if best is None else best[1]
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_matches_bruteforce_decimal(seed):
+    """临界小数值与十进制暴力参考对照：略超/略短值密集出现，容差即误判。"""
+    rng = random.Random(seed + 20_000)
+    n = rng.randint(1, 7)
+    heights = [
+        rng.choice([0.1, 0.2, 0.3, 0.5, 1.0, 1.0000000005, 0.9999999999])
+        for _ in range(n)
+    ]
+    silences = [
+        rng.choice([0.0, 0.9999999999, 1.0, 1.0000000005, 2.5])
+        for _ in range(n)
+    ]
+    page_height = rng.choice([0.3, 0.6, 1.0, 2.0, 2.9999999999, 3.0000000005])
+    min_turn_time = rng.choice([0.0, 1.0, 1.0000000005])
+
+    too_tall = any(Decimal(str(h)) > Decimal(str(page_height)) for h in heights)
+    expected = brute_force_best_decimal(
+        heights, silences, page_height, min_turn_time
+    )
+
+    if too_tall:
+        with pytest.raises(PlanningError, match="超过页面可用高度"):
+            plan_pages(heights, silences, page_height, min_turn_time)
+        return
+
+    if expected is None:
+        with pytest.raises(PlanningError, match="无合法翻页方案"):
+            plan_pages(heights, silences, page_height, min_turn_time)
+    else:
+        plan = plan_pages(heights, silences, page_height, min_turn_time)
+        assert plan.breaks == expected, (
+            f"mismatch h={heights} s={silences} H={page_height} t={min_turn_time}"
+        )
+        # 页高度按十进制精确比较均不超限、断页静默均达标
+        for p in plan.pages:
+            assert Decimal(str(p.used_height)) <= Decimal(str(page_height))
+        for b in plan.breaks:
+            assert Decimal(str(silences[b - 1])) >= Decimal(str(min_turn_time))

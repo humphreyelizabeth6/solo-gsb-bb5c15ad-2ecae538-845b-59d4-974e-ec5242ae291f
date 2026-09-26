@@ -29,22 +29,53 @@
 3. 在阈值 t 下做后缀 min/max 页数 DP（必翻点通过页尾上界强制），贪心选择
    最小的合法断页序号，得到字典序最小的断页序列。
 
+数值表示
+========
+所有输入数值（小节高度、静默秒数、页面可用高度、最低翻页时间）先按用户书写
+的**十进制字面量**解释（如 0.1 就是精确的 1/10，经 ``Decimal(str(x))`` 转换），
+再按"高度与页高"、"静默与最低翻页时间"两组分别放大为**同比例整数**（定点
+十进制：比例取组内最大的小数位数，乘 10**k 后每个值都是整数）；累计高度为
+整数前缀和。单节容量、整页容量、最低翻页静默、最短静默阈值搜索与断页重构
+中的全部比较因此都是**精确的十进制比较**，不使用浮点容差。因此：
+
+- 略超边界即不合格：高度 1.0000000005 对页高 1 判定单节超高；
+  静默 0.9999999999 对最低翻页时间 1 的位置不可翻页；
+- 恰好达到边界仍合格：0.1 + 0.2 在十进制下恰为 0.3，可同页排入页高 0.3；
+  静默恰好等于最低翻页时间（或阈值）允许翻页（>= 判定）；
+- 输入数值必须是有限值（不接受 NaN 或 Infinity），否则直接报错。
+
 单小节高度超过页面可用高度时无法排版，直接报错。
 """
 
 from __future__ import annotations
 
-from bisect import bisect_left
+import math
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Callable, List, Optional, Sequence
 
 INF = 10**15
 
 
-def _eps(magnitude: float) -> float:
-    """随高度量级缩放的浮点容差，避免长序列前缀和的累加误差导致误判。"""
-    return 1e-9 * max(1.0, abs(magnitude))
+def _to_scaled_ints(values: Sequence[float]) -> tuple[List[int], int]:
+    """把一组十进制字面量转成同一比例下的整数，返回 ``(整数列表, 比例 10**k)``。
+
+    每个值先按 ``str`` 的最短十进制表示（即用户书写的数值）转成 ``Decimal``
+    ——0.1 即精确的 1/10，不带二进制浮点表示误差；k 取所有值小数位数的最大
+    值，使每个值乘 10**k 后都是整数。同组数值在该比例下做整数精确比较，
+    0.1 + 0.2 与 0.3 因此严格相等。
+    """
+    decs = [Decimal(str(v)) for v in values]
+    k = 0
+    for d in decs:
+        exp = d.as_tuple().exponent
+        if exp < 0 and -exp > k:
+            k = -exp
+    if k:
+        return [int(d.scaleb(k)) for d in decs], 10 ** k
+    return [int(d) for d in decs], 1
 
 
 class PlanningError(ValueError):
@@ -74,21 +105,22 @@ class Plan:
     breaks: List[int]
 
 
-def _page_end_range(prefix: Sequence[float], r: int, page_height: float) -> tuple[int, int]:
+def _page_end_range(prefix: Sequence[int], r: int, page_height: int) -> tuple[int, int]:
     """以第 r 个小节（0 基）为页尾时，页首 l（0 基）的取值范围。
 
     页内容为小节 l..r，高度为 prefix[r+1] - prefix[l] <= page_height，
-    即 prefix[l] >= prefix[r+1] - page_height。
+    即 prefix[l] >= prefix[r+1] - page_height；整数精确比较下
+    bisect_left 直接给出最小的合法 l。
     """
     threshold = prefix[r + 1] - page_height
-    lo = bisect_left(prefix, threshold - _eps(threshold), 0, r + 1)
+    lo = bisect_left(prefix, threshold, 0, r + 1)
     return lo, r
 
 
 def _min_pages_forward(
     n: int,
-    prefix: Sequence[float],
-    page_height: float,
+    prefix: Sequence[int],
+    page_height: int,
     allowed: Callable[[int], bool],
     floor_forced: Optional[Sequence[int]] = None,
 ) -> List[int]:
@@ -126,8 +158,8 @@ def _min_pages_forward(
 
 def _suffix_min_max_pages(
     n: int,
-    prefix: Sequence[float],
-    page_height: float,
+    prefix: Sequence[int],
+    page_height: int,
     allowed: Callable[[int], bool],
     next_forced: Optional[Sequence[int]] = None,
 ) -> tuple[List[int], List[int]]:
@@ -172,12 +204,10 @@ def _suffix_min_max_pages(
                     max_dq.pop()
                 max_dq.append(e)
         # 页 [i..e-1] 高度 = prefix[e] - prefix[i] <= page_height，
-        # 即 prefix[e] <= prefix[i] + page_height；bisect_left 给出第一个
-        # 超限的索引，减 1 得最大合法 e。
+        # 即 prefix[e] <= prefix[i] + page_height；整数精确比较下
+        # bisect_right 给出最后一个不超限元素的后一位置，减 1 得最大合法 e。
         max_height = prefix[i] + page_height
-        max_e = (
-            bisect_left(prefix, max_height + _eps(max_height), i + 1, n + 1) - 1
-        )
+        max_e = bisect_right(prefix, max_height, i + 1, n + 1) - 1
         # 必翻点上界：本页不得越过 i 之后的第一个必翻点。
         max_e = min(max_e, next_forced[i])
         while min_dq and min_dq[0] > max_e:
@@ -253,16 +283,50 @@ def plan_pages(
     （页数、最短翻页静默、断页序列字典序）始终在全篇所有满足约束的方案中
     统一比较，不按必翻点分段取局部最优。
 
-    :raises PlanningError: 约束序号非法、必翻点静默不足、单小节超高，
-        或不存在任何合法断页方案。
+    所有数值按十进制字面量解释并做精确十进制比较（见模块文档"数值表示"节）：
+    略超页高/略短静默一律不合格，0.1 + 0.2 恰达页高 0.3 仍可同页。
+
+    :raises PlanningError: 数值含 NaN/Infinity、约束序号非法、必翻点静默不足、
+        单小节超高，或不存在任何合法断页方案。
     """
     n = len(heights)
 
+    # 非有限数值无法做十进制精确比较，直接判定输入非法。
     for i, h in enumerate(heights):
-        if h > page_height + _eps(page_height):
+        if not math.isfinite(h):
             raise PlanningError(
-                f"第 {i + 1} 小节高度 {h:g} 超过页面可用高度 {page_height:g}，"
-                "小节不可拆开，无法排版。"
+                f"第 {i + 1} 小节高度不是有限数值（{h!r}）：不接受 NaN 或 Infinity。"
+            )
+    for i, s in enumerate(silences):
+        if not math.isfinite(s):
+            raise PlanningError(
+                f"第 {i + 1} 小节后的静默秒数不是有限数值（{s!r}）："
+                "不接受 NaN 或 Infinity。"
+            )
+    if not math.isfinite(page_height):
+        raise PlanningError(
+            f"页面可用高度不是有限数值（{page_height!r}）：不接受 NaN 或 Infinity。"
+        )
+    if not math.isfinite(min_turn_time):
+        raise PlanningError(
+            f"最低翻页时间不是有限数值（{min_turn_time!r}）：不接受 NaN 或 Infinity。"
+        )
+
+    # 高度与页高、静默与最低翻页时间分别放大为同比例整数（定点十进制），
+    # 后续所有比较——单节/整页容量、最低翻页静默、最短静默阈值搜索与
+    # 断页重构——都是同一套十进制表示下的整数精确比较，不使用浮点容差。
+    scaled_heights, height_scale = _to_scaled_ints([page_height, *heights])
+    i_page_height = scaled_heights[0]
+    i_heights = scaled_heights[1:]
+    scaled_silences, _ = _to_scaled_ints([min_turn_time, *silences])
+    i_min_turn = scaled_silences[0]
+    i_silences = scaled_silences[1:]
+
+    for i, ih in enumerate(i_heights):
+        if ih > i_page_height:
+            raise PlanningError(
+                f"第 {i + 1} 小节高度 {heights[i]} 超过页面可用高度"
+                f" {page_height}，小节不可拆开，无法排版。"
             )
 
     required, forbidden = _validate_break_constraints(
@@ -270,21 +334,17 @@ def plan_pages(
     )
 
     # 必翻位置本身必须是合法翻页点：其后静默不足则不存在满足约束的方案。
-    quiet_required = [
-        b
-        for b in required
-        if silences[b - 1] + _eps(min_turn_time) < min_turn_time
-    ]
+    quiet_required = [b for b in required if i_silences[b - 1] < i_min_turn]
     if quiet_required:
         b = quiet_required[0]
         raise PlanningError(
-            f"必翻位置 {b}（第 {b} 小节之后）静默仅 {silences[b - 1]:g} 秒，"
-            f"低于最低翻页时间 {min_turn_time:g} 秒，必翻点静默不足，无合法方案。"
+            f"必翻位置 {b}（第 {b} 小节之后）静默仅 {silences[b - 1]} 秒，"
+            f"低于最低翻页时间 {min_turn_time} 秒，必翻点静默不足，无合法方案。"
         )
 
-    prefix: List[float] = [0.0]
-    for h in heights:
-        prefix.append(prefix[-1] + h)
+    prefix: List[int] = [0]
+    for ih in i_heights:
+        prefix.append(prefix[-1] + ih)
 
     # 断页位置 b（下一页从第 b 小节开始，0 基）：
     # b == 0 是起点占位；内部翻页看第 b-1 小节后的静默；b == n 为文档结束，
@@ -292,7 +352,7 @@ def plan_pages(
     def baseline_allowed(b: int) -> bool:
         if b <= 0 or b >= n or b in forbidden:
             return False
-        return silences[b - 1] + _eps(min_turn_time) >= min_turn_time
+        return i_silences[b - 1] >= i_min_turn
 
     # floor_forced[r]：<= r 的最后一个必翻点（0 表示无）。页 [l..r] 内含必翻点
     # q（l <= q <= r）时唯一合法情形是 l == q，即 l >= floor_forced[r]。
@@ -305,7 +365,7 @@ def plan_pages(
             cursor += 1
         floor_forced[r] = last
 
-    f = _min_pages_forward(n, prefix, page_height, baseline_allowed, floor_forced)
+    f = _min_pages_forward(n, prefix, i_page_height, baseline_allowed, floor_forced)
     total = f[n - 1]
     if total >= INF:
         raise PlanningError(
@@ -320,7 +380,7 @@ def plan_pages(
             start_measure=0,
             end_measure=n - 1,
             measure_count=n,
-            used_height=prefix[n],
+            used_height=prefix[n] / height_scale,
             turn_silence=None,
         )
         return Plan(pages=[page], page_count=1, shortest_turn_silence=None, breaks=[])
@@ -339,17 +399,17 @@ def plan_pages(
 
     # ---- 第二步：最大化最短翻页静默（全篇统一，不按必翻点分段） ----
     candidates = sorted(
-        {silences[b - 1] for b in range(1, n) if baseline_allowed(b)}
+        {i_silences[b - 1] for b in range(1, n) if baseline_allowed(b)}
     )
 
-    def feasible(threshold: float) -> bool:
+    def feasible(threshold: int) -> bool:
         def allowed_t(b: int) -> bool:
             if b <= 0 or b >= n or b in forbidden:
                 return False
-            return silences[b - 1] + _eps(threshold) >= threshold
+            return i_silences[b - 1] >= threshold
 
         ft = _min_pages_forward(
-            n, prefix, page_height, allowed_t, floor_forced
+            n, prefix, i_page_height, allowed_t, floor_forced
         )
         return ft[n - 1] <= total
 
@@ -366,10 +426,10 @@ def plan_pages(
     def best_allowed(b: int) -> bool:
         if b <= 0 or b >= n or b in forbidden:
             return False
-        return silences[b - 1] + _eps(best_threshold) >= best_threshold
+        return i_silences[b - 1] >= best_threshold
 
     smin, smax = _suffix_min_max_pages(
-        n, prefix, page_height, best_allowed, next_forced
+        n, prefix, i_page_height, best_allowed, next_forced
     )
 
     breaks: List[int] = []
@@ -377,10 +437,8 @@ def plan_pages(
     remaining = total
     while remaining > 1:
         # 本页结束后下一断页 b（页 [start..b-1]），之后后缀用 remaining-1 页排完。
-        max_height = prefix[start] + page_height
-        max_b = (
-            bisect_left(prefix, max_height + _eps(max_height), start + 1, n + 1) - 1
-        )
+        max_height = prefix[start] + i_page_height
+        max_b = bisect_right(prefix, max_height, start + 1, n + 1) - 1
         # 本页不得越过 start 之后的第一个必翻点：必翻点强制作为下一页页首，
         # 故候选 b 最大到 next_forced[start]（恰为该必翻点时即在此必翻）。
         max_b = min(max_b, next_forced[start])
@@ -399,7 +457,7 @@ def plan_pages(
     if not set(required) <= set(breaks):  # 防御：必翻点必须全部出现
         raise PlanningError("内部错误：重构翻页方案遗漏必翻位置。")
 
-    # ---- 组装页信息 ----
+    # ---- 组装页信息（整数按比例换算回浮点输出） ----
     boundaries = [0] + breaks + [n]
     pages: List[Page] = []
     turn_values: List[float] = []
@@ -415,7 +473,7 @@ def plan_pages(
                 start_measure=a,
                 end_measure=e - 1,
                 measure_count=e - a,
-                used_height=prefix[e] - prefix[a],
+                used_height=(prefix[e] - prefix[a]) / height_scale,
                 turn_silence=silence,
             )
         )

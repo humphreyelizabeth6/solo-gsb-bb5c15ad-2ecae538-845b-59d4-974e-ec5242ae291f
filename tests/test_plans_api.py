@@ -178,6 +178,82 @@ def test_single_measure_requires_empty_constraints(client):
     assert "越界序号 1" in bad.text
 
 
+def test_decimal_boundary_end_to_end(client):
+    # 略超页高：1.0000000005 > 1，单小节超高 -> 422
+    tall = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [1.0000000005],
+            "silence_seconds": [0],
+            "page_height": 1,
+            "min_turn_time": 0,
+        },
+    )
+    assert tall.status_code == 422
+    assert "超过页面可用高度" in tall.json()["detail"]
+
+    # 0.1 + 0.2 在十进制下恰为 0.3：同页排版，used_height 恰为 0.3
+    fit = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [0.1, 0.2],
+            "silence_seconds": [5, 0],
+            "page_height": 0.3,
+            "min_turn_time": 1,
+        },
+    )
+    assert fit.status_code == 201, fit.text
+    result = fit.json()["result"]
+    assert result["page_count"] == 1
+    assert result["pages"][0]["used_height"] == 0.3
+
+    # 静默 1 与 1.0000000005 是不同值：最短静默最大化选断页 2
+    gap = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [1, 1, 1],
+            "silence_seconds": [1, 1.0000000005, 0],
+            "page_height": 2,
+            "min_turn_time": 1,
+        },
+    )
+    assert gap.status_code == 201, gap.text
+    assert gap.json()["result"]["breaks"] == [2]
+    assert gap.json()["result"]["shortest_turn_silence"] == 1.0000000005
+
+    # 略短静默（0.9999999999 < 1）不得视作达标 -> 无合法方案
+    short = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [5, 5],
+            "silence_seconds": [0.9999999999, 0],
+            "page_height": 6,
+            "min_turn_time": 1,
+        },
+    )
+    assert short.status_code == 422
+    assert "无合法翻页方案" in short.json()["detail"]
+
+
+def test_non_finite_values_rejected_with_422(client):
+    # httpx 的 json= 用严格 JSON（拒绝 NaN/Infinity），改发原始请求体：
+    # 服务端 json.loads 默认接受 NaN/Infinity 字面量，规划层应判定 422。
+    cases = [
+        '{"measure_heights": [1, NaN], "silence_seconds": [0, 0], "page_height": 2, "min_turn_time": 0}',
+        '{"measure_heights": [1, 1], "silence_seconds": [Infinity, 0], "page_height": 2, "min_turn_time": 0}',
+        '{"measure_heights": [1, 1], "silence_seconds": [0, 0], "page_height": NaN, "min_turn_time": 0}',
+        '{"measure_heights": [1, 1], "silence_seconds": [0, 0], "page_height": 2, "min_turn_time": Infinity}',
+    ]
+    for body in cases:
+        resp = client.post(
+            "/api/v1/plans",
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422, (body, resp.text)
+        assert "不是有限数值" in resp.text
+
+
 def test_saved_constrained_plan_supports_rehearsal_endpoints(client):
     """带约束保存的方案仍可被排练定位/提示接口读取。"""
     payload = dict(_BASE, required_breaks=[5, 8])
